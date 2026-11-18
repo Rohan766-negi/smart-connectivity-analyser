@@ -25,6 +25,9 @@ let downtimeSeconds = 0;
 let currentLocation = null;
 let sessionTests = [];
 let savedLocations = [];
+let metricsRestoredFromHistory = false;
+let offlineClearedMetrics = false;
+let wasDeviceOffline = false;
 
 let currentMetrics = {
     download: null,
@@ -33,6 +36,7 @@ let currentMetrics = {
     jitter: null,
     packetLoss: null,
     networkType: "Unknown",
+    networkTypeDetail: "Connection type",
     score: 0
 };
 
@@ -118,6 +122,18 @@ function formatMetric(value, unitOrDecimals = "", decimals = 1) {
 
 // ─── Metric Validation & Formatting Helpers ────────────
 
+/*
+   The shared, unit-tested scoring function from
+   js/connectivity-score.js. index.html loads that module before
+   this file, so the browser uses the global it defines; the Node
+   tests require it directly here.
+*/
+
+const sharedCalculateConnectivityScore =
+    typeof calculateConnectivityScore !== "undefined"
+        ? calculateConnectivityScore
+        : require("./connectivity-score.js").calculateConnectivityScore;
+
 function isValidMetricNumber(value) {
     if (
         value === null ||
@@ -146,10 +162,29 @@ function formatNetworkMetric(metricType, value, decimals = 1) {
 
     return formatMetric(value, unit, decimals);
 }
+/**
+ * Mark the Start Test button as busy without using the `disabled`
+ * attribute. A disabled button loses keyboard focus, which drops a
+ * keyboard user back to the top of the page. Repeat clicks are already
+ * ignored by the `testInProgress` check in startNetworkTest().
+ */
+function setStartButtonBusy(button, busy) {
+    if (!button) return;
+
+    button.setAttribute?.("aria-disabled", String(busy));
+    button.setAttribute?.("aria-busy", String(busy));
+
+    const label = $("startTestLabel");
+
+    if (label) {
+        label.textContent = busy ? "Testing..." : "Start Test";
+    }
+}
+
 function setProgress(id, value) {
     const element = $(id);
 
-    if (!element) return;
+    if (!element || !element.style) return;
 
     element.style.width =
         `${Math.max(0, Math.min(100, Number(value) || 0))}%`;
@@ -175,10 +210,12 @@ async function initializeApplication() {
     if (applicationInitialized) return;
 
     applicationInitialized = true;
+    wasDeviceOffline = isDeviceOffline();
 
     setupButtons();
     setupNetworkListeners();
     detectNetworkType();
+    applyConnectivityStatusIndicator();
 
     initializeMap();
     initializeChart();
@@ -240,16 +277,233 @@ function setupButtons() {
     );
 }
 
+const STATUS_INDICATOR_CLASSES = Object.freeze([
+    "connected",
+    "online",
+    "disconnected",
+    "offline",
+    "testing",
+    "excellent",
+    "good",
+    "fair",
+    "poor"
+]);
+
+function getBrowserConnection() {
+    if (typeof navigator === "undefined") return null;
+
+    return (
+        navigator.connection ||
+        navigator.mozConnection ||
+        navigator.webkitConnection ||
+        null
+    );
+}
+
+function isDeviceOffline(
+    connection = getBrowserConnection(),
+    isOnline = typeof navigator !== "undefined" && typeof navigator.onLine === "boolean"
+        ? navigator.onLine
+        : true
+) {
+    return resolveNetworkType(connection, isOnline).type === "Offline";
+}
+
+function clearLiveMetrics() {
+    currentMetrics.download = null;
+    currentMetrics.upload = null;
+    currentMetrics.ping = null;
+    currentMetrics.jitter = null;
+    currentMetrics.packetLoss = null;
+    currentMetrics.score = 0;
+    metricsRestoredFromHistory = false;
+    offlineClearedMetrics = true;
+}
+
+function resolveConnectivityIndicator(
+    score,
+    { isOffline = false, isTesting = false } = {}
+) {
+    if (isOffline) {
+        return {
+            status: "Offline",
+            dotClass: "disconnected",
+            score: 0
+        };
+    }
+
+    const numericScore = Number.isFinite(Number(score))
+        ? Math.max(0, Number(score))
+        : 0;
+
+    if (isTesting) {
+        return {
+            status: "Testing",
+            dotClass: "testing",
+            score: numericScore
+        };
+    }
+
+    if (numericScore >= 80) {
+        return { status: "Excellent", dotClass: "excellent", score: numericScore };
+    }
+
+    if (numericScore >= 60) {
+        return { status: "Good", dotClass: "good", score: numericScore };
+    }
+
+    if (numericScore >= 40) {
+        return { status: "Fair", dotClass: "fair", score: numericScore };
+    }
+
+    if (numericScore > 0) {
+        return { status: "Poor", dotClass: "poor", score: numericScore };
+    }
+
+    return {
+        status: "Online",
+        dotClass: "connected",
+        score: 0
+    };
+}
+
+function resolveDashboardDisplayState(
+    metrics = {},
+    {
+        isOffline = false,
+        isTesting = false,
+        isHistoryRestored = false
+    } = {}
+) {
+    if (isOffline) {
+        return {
+            download: "Unavailable",
+            upload: "Unavailable",
+            ping: "Unavailable",
+            jitter: "Unavailable",
+            packetLoss: "Unavailable",
+            score: 0,
+            metricsSubtitle: "Offline — live measurements unavailable",
+            indicator: resolveConnectivityIndicator(0, {
+                isOffline: true,
+                isTesting
+            })
+        };
+    }
+
+    const score = Number.isFinite(Number(metrics.score))
+        ? Math.max(0, Number(metrics.score))
+        : sharedCalculateConnectivityScore(metrics);
+
+    return {
+        download: formatMetric(metrics.download),
+        upload: formatMetric(metrics.upload),
+        ping: formatMetric(metrics.ping),
+        jitter: formatMetric(metrics.jitter),
+        packetLoss: formatMetric(metrics.packetLoss),
+        score,
+        metricsSubtitle: isHistoryRestored
+            ? "Last recorded measurements (run a test for live metrics)"
+            : "Live performance measurements",
+        indicator: resolveConnectivityIndicator(score, {
+            isOffline: false,
+            isTesting
+        })
+    };
+}
+
+function applyConnectivityStatusIndicator(score = currentMetrics.score) {
+    const indicator = resolveConnectivityIndicator(score, {
+        isOffline: isDeviceOffline(),
+        isTesting: testInProgress
+    });
+
+    if (typeof document === "undefined") {
+        return indicator;
+    }
+
+    setText("status", indicator.status);
+
+    const dot = typeof $ === "function" ? $("networkStatusDot") : null;
+    if (dot) {
+        dot.classList?.remove(...STATUS_INDICATOR_CLASSES);
+        dot.classList?.add(indicator.dotClass);
+        if (dot.dataset) {
+            dot.dataset.status = indicator.status.toLowerCase();
+        }
+        dot.setAttribute?.("aria-label", `Connectivity status: ${indicator.status}`);
+        dot.setAttribute?.("title", `Connectivity status: ${indicator.status}`);
+    }
+
+    const statusEl = typeof $ === "function" ? $("status") : null;
+    if (statusEl) {
+        statusEl.classList?.remove(...STATUS_INDICATOR_CLASSES);
+        statusEl.classList?.add(indicator.dotClass);
+    }
+
+    return indicator;
+}
+
+function handleConnectivityTransition({ showToastNotification = false } = {}) {
+    const network = detectNetworkType();
+    const offline = network.type === "Offline" || isDeviceOffline();
+
+    if (offline) {
+        clearLiveMetrics();
+        updateDashboard();
+        updateApplicationReadiness();
+        updateNetworkRecommendation();
+
+        if (!testInProgress) {
+            setText(
+                "testMessage",
+                "Your device is offline. Connect to a network first."
+            );
+        }
+
+        if (showToastNotification && !wasDeviceOffline) {
+            showToast("Internet connection lost.");
+        }
+    } else {
+        if (wasDeviceOffline && !testInProgress) {
+            setText(
+                "testMessage",
+                "Run a connectivity test to analyse your network."
+            );
+        }
+
+        updateDashboard();
+        updateApplicationReadiness();
+        updateNetworkRecommendation();
+
+        if (showToastNotification && wasDeviceOffline) {
+            showToast("Internet connection restored.");
+        }
+    }
+
+    wasDeviceOffline = offline;
+}
+
 function setupNetworkListeners() {
     window.addEventListener("online", () => {
-        updateNetworkStatus();
-        showToast("Internet connection restored.");
+        handleConnectivityTransition({ showToastNotification: true });
     });
 
     window.addEventListener("offline", () => {
-        updateNetworkStatus();
-        showToast("Internet connection lost.");
+        handleConnectivityTransition({ showToastNotification: true });
     });
+
+    const connection = getBrowserConnection();
+
+    if (connection && typeof connection.addEventListener === "function") {
+        connection.addEventListener("change", () => {
+            handleConnectivityTransition({ showToastNotification: true });
+        });
+    } else if (connection && "onchange" in connection) {
+        connection.onchange = () => {
+            handleConnectivityTransition({ showToastNotification: true });
+        };
+    }
 
     window.addEventListener("resize", () => {
         connectivityMap?.invalidateSize();
@@ -257,7 +511,7 @@ function setupNetworkListeners() {
     });
 
     setInterval(() => {
-        if (!navigator.onLine) {
+        if (isDeviceOffline()) {
             downtimeSeconds++;
         }
 
@@ -266,51 +520,144 @@ function setupNetworkListeners() {
 }
 
 function updateNetworkStatus() {
-    const dot = $("networkStatusDot");
+    return applyConnectivityStatusIndicator(currentMetrics.score);
+}
 
-    if (!navigator.onLine) {
-        setText("status", "Offline");
-
-        dot?.classList.remove("connected", "testing");
-        dot?.classList.add("disconnected");
-    } else if (!testInProgress) {
-        setText(
-            "status",
-            currentMetrics.score
-                ? getConnectivityStatus(currentMetrics.score)
-                : "Online"
-        );
-
-        dot?.classList.remove("disconnected", "testing");
-        dot?.classList.add("connected");
+/**
+ * Resolves reliable network type information from browser connection data.
+ *
+ * Distinguishes verified physical media (Wi-Fi, Cellular, Ethernet, Bluetooth, WiMAX)
+ * from synthetic or unverified metrics. Avoids presenting an unverified cellular
+ * generation (e.g. from effectiveType '3g'/'4g') as a confirmed hardware result.
+ *
+ * @param {Object|null|undefined} connection - navigator.connection object
+ * @param {boolean} [isOnline=true] - Browser online status
+ * @returns {{type: string, detail: string, isKnown: boolean, effectiveType: string|null}}
+ */
+function resolveNetworkType(connection, isOnline = true) {
+    if (!isOnline) {
+        return {
+            type: "Offline",
+            detail: "No internet connection",
+            isKnown: true,
+            effectiveType: null
+        };
     }
+
+    if (!connection || typeof connection !== "object") {
+        return {
+            type: "Unknown",
+            detail: "Network Information API not supported by browser",
+            isKnown: false,
+            effectiveType: null
+        };
+    }
+
+    const rawType = typeof connection.type === "string"
+        ? connection.type.toLowerCase().trim()
+        : "";
+
+    const rawEffectiveType = typeof connection.effectiveType === "string"
+        ? connection.effectiveType.toLowerCase().trim()
+        : null;
+
+    if (rawType === "none") {
+        return {
+            type: "Offline",
+            detail: "No active network connection",
+            isKnown: true,
+            effectiveType: null
+        };
+    }
+
+    if (rawType === "wifi" || rawType === "wlan") {
+        return {
+            type: "Wi-Fi",
+            detail: "Wi-Fi connection",
+            isKnown: true,
+            effectiveType: rawEffectiveType
+        };
+    }
+
+    if (rawType === "cellular" || rawType === "mobile" || rawType.startsWith("cellular")) {
+        const speedContext = rawEffectiveType
+            ? `Cellular (~${rawEffectiveType.toUpperCase()} speed tier, generation unverified)`
+            : "Cellular connection (generation unverified)";
+
+        return {
+            type: "Mobile",
+            detail: speedContext,
+            isKnown: true,
+            effectiveType: rawEffectiveType
+        };
+    }
+
+    if (rawType === "ethernet") {
+        return {
+            type: "Ethernet",
+            detail: "Wired ethernet connection",
+            isKnown: true,
+            effectiveType: rawEffectiveType
+        };
+    }
+
+    if (rawType === "bluetooth") {
+        return {
+            type: "Bluetooth",
+            detail: "Bluetooth tethering connection",
+            isKnown: true,
+            effectiveType: rawEffectiveType
+        };
+    }
+
+    if (rawType === "wimax") {
+        return {
+            type: "WiMAX",
+            detail: "WiMAX wireless connection",
+            isKnown: true,
+            effectiveType: rawEffectiveType
+        };
+    }
+
+    // When connection.type is missing, "other", "unknown", or unrecognized:
+    // Do NOT treat effectiveType (e.g. "3g" or "4g") as confirmed network type.
+    const speedTierNote = rawEffectiveType
+        ? `Estimated ~${rawEffectiveType.toUpperCase()} speed tier (medium unverified)`
+        : "Network type not reported by browser";
+
+    return {
+        type: "Unknown",
+        detail: speedTierNote,
+        isKnown: false,
+        effectiveType: rawEffectiveType
+    };
 }
 
 function detectNetworkType() {
-    const connection =
-        navigator.connection ||
-        navigator.mozConnection ||
-        navigator.webkitConnection;
+    const isOnline =
+        typeof navigator !== "undefined" && typeof navigator.onLine === "boolean"
+            ? navigator.onLine
+            : true;
 
-    let type = "Unknown";
+    const connection = getBrowserConnection();
 
-    if (connection?.type) {
-        type = connection.type;
-    } else if (connection?.effectiveType) {
-        type = connection.effectiveType.toUpperCase();
+    const result = resolveNetworkType(connection, isOnline);
+
+    currentMetrics.networkType = result.type;
+    currentMetrics.networkTypeDetail = result.detail;
+
+    if (typeof document !== "undefined") {
+        setText("networkType", result.type);
+        setText("networkTypeDetail", result.detail);
+
+        const networkTypeEl = typeof $ === "function" ? $("networkType") : null;
+        if (networkTypeEl) {
+            networkTypeEl.setAttribute("title", result.detail);
+            networkTypeEl.dataset.known = String(result.isKnown);
+        }
     }
 
-    if (type.toLowerCase() === "wifi") {
-        type = "Wi-Fi";
-    }
-
-    if (type.toLowerCase() === "cellular") {
-        type = "Mobile";
-    }
-
-    currentMetrics.networkType = type;
-
-    setText("networkType", type);
+    return result;
 }
 
 /* =========================================================
@@ -330,7 +677,7 @@ function initializeMap() {
 
         setText(
             "locationResult",
-            "Leaflet did not load. Check the Leaflet CDN scripts."
+            "The map could not load. Check your internet connection and refresh the page."
         );
 
         return;
@@ -384,7 +731,7 @@ function initializeMap() {
 
         setText(
             "locationResult",
-            "Unable to initialize the map."
+            "The map could not be started. Refresh the page to try again."
         );
     }
 }
@@ -694,7 +1041,7 @@ function initializeChart() {
 
         setText(
             "testMessage",
-            "Chart.js could not load. Check the Chart.js CDN."
+            "The history chart could not load. Check your internet connection and refresh the page."
         );
 
         return;
@@ -1031,6 +1378,7 @@ async function loadNetworkHistory(range = null) {
 
     const canvasContainer = $("historyChartContainer");
     const emptyState = $("historyEmptyState");
+    const errorState = $("historyErrorState");
 
     try {
         setHistoryFilterMessage("Loading network history...");
@@ -1064,6 +1412,8 @@ async function loadNetworkHistory(range = null) {
             throw new Error("Unexpected network history format.");
         }
 
+        if (errorState) errorState.hidden = true;
+
         sessionTests = data
             .map(normalizeHistoryItem)
             .filter((item) =>
@@ -1083,9 +1433,7 @@ async function loadNetworkHistory(range = null) {
 
             updateSessionStatistics();
 
-            setHistoryFilterMessage(
-                "No records match the selected filters."
-            );
+            setHistoryFilterMessage("");
 
             return;
         }
@@ -1107,25 +1455,35 @@ async function loadNetworkHistory(range = null) {
             `Showing ${sessionTests.length} matching network record(s).`
         );
 
-        // Preserve the existing latest-measurement restoration.
+        // Preserve latest-measurement restoration only when online and not cleared by offline transition.
         const latest = sessionTests[sessionTests.length - 1];
 
-        if (
-            currentMetrics.download === null &&
-            latest.download_mbps !== null
-        ) {
-            currentMetrics.download = Number(
-                latest.download_mbps
-            );
-        }
+        if (!isDeviceOffline() && !offlineClearedMetrics && latest) {
+            let restored = false;
 
-        if (
-            currentMetrics.upload === null &&
-            latest.upload_mbps !== null
-        ) {
-            currentMetrics.upload = Number(
-                latest.upload_mbps
-            );
+            if (
+                currentMetrics.download === null &&
+                latest.download_mbps !== null
+            ) {
+                currentMetrics.download = Number(
+                    latest.download_mbps
+                );
+                restored = true;
+            }
+
+            if (
+                currentMetrics.upload === null &&
+                latest.upload_mbps !== null
+            ) {
+                currentMetrics.upload = Number(
+                    latest.upload_mbps
+                );
+                restored = true;
+            }
+
+            if (restored) {
+                metricsRestoredFromHistory = true;
+            }
         }
 
     } catch (error) {
@@ -1146,12 +1504,13 @@ async function loadNetworkHistory(range = null) {
             emptyState.hidden = true;
         }
 
+        if (errorState) {
+            errorState.hidden = false;
+        }
+
         updateSessionStatistics();
 
-        setHistoryFilterMessage(
-            "Unable to load network history. Check the backend connection.",
-            true
-        );
+        setHistoryFilterMessage("");
     }
 }
 
@@ -1206,17 +1565,72 @@ function updateHistoryChart(history = sessionTests, range = null) {
         filtered.map((item) => item.download_mbps);
 
     networkChart.update();
+
+    updateChartDescription(filtered);
+}
+
+/**
+ * Keep the canvas aria-label in step with the plotted data, because
+ * screen readers cannot read the pixels Chart.js draws.
+ */
+function updateChartDescription(items) {
+    const canvas = $("networkChart");
+
+    if (!canvas?.setAttribute) return;
+
+    if (!items.length) {
+        canvas.setAttribute(
+            "aria-label",
+            "Network history chart. No network history is available for the selected range."
+        );
+        return;
+    }
+
+    const latest = items[items.length - 1];
+    const parts = [
+        `Network history chart showing ${items.length} test${items.length === 1 ? "" : "s"}.`
+    ];
+
+    if (isValidMetric(latest.connectivity_score)) {
+        parts.push(
+            `Latest connectivity score: ${Math.round(Number(latest.connectivity_score))} out of 100.`
+        );
+    }
+
+    if (isValidMetric(latest.download_mbps)) {
+        parts.push(
+            `Latest download speed: ${Number(latest.download_mbps).toFixed(1)} Mbps.`
+        );
+    }
+
+    canvas.setAttribute("aria-label", parts.join(" "));
 }
 
 /* =========================================================
    NETWORK TEST
    ========================================================= */
 
+function abortTestIfOffline() {
+    if (!isDeviceOffline()) return false;
+
+    clearLiveMetrics();
+    detectNetworkType();
+    updateDashboard();
+    updateApplicationReadiness();
+    updateNetworkRecommendation();
+    showToast("Internet connection lost during test.");
+    return true;
+}
+
 async function startNetworkTest() {
     if (testInProgress) return;
 
-    if (!navigator.onLine) {
-        setText("status", "Offline");
+    if (isDeviceOffline()) {
+        clearLiveMetrics();
+        detectNetworkType();
+        updateDashboard();
+        updateApplicationReadiness();
+        updateNetworkRecommendation();
 
         setText(
             "testMessage",
@@ -1228,17 +1642,12 @@ async function startNetworkTest() {
     }
 
     testInProgress = true;
+    metricsRestoredFromHistory = false;
+    offlineClearedMetrics = false;
 
     const button = $("startTest");
 
-    if (button) {
-        button.disabled = true;
-        button.textContent = "Testing...";
-    }
-
-    $("networkStatusDot")?.classList.add("testing");
-
-    setText("status", "Testing");
+    setStartButtonBusy(button, true);
 
     setText(
         "testMessage",
@@ -1252,6 +1661,7 @@ async function startNetworkTest() {
         jitter: null,
         packetLoss: null,
         networkType: currentMetrics.networkType,
+        networkTypeDetail: currentMetrics.networkTypeDetail,
         score: 0
     };
 
@@ -1264,6 +1674,8 @@ async function startNetworkTest() {
                 runCloudflareBandwidthTest()
             ]);
 
+        if (abortTestIfOffline()) return;
+
         applyBackendMetrics(backendResult);
         applyBandwidthMetrics(bandwidthResult);
 
@@ -1272,6 +1684,8 @@ async function startNetworkTest() {
             currentMetrics.jitter === null
         ) {
             const latency = await measureBrowserLatency();
+
+            if (abortTestIfOffline()) return;
 
             if (currentMetrics.ping === null) {
                 currentMetrics.ping = latency.ping;
@@ -1282,10 +1696,12 @@ async function startNetworkTest() {
             }
         }
 
+        if (abortTestIfOffline()) return;
+
         detectNetworkType();
 
         currentMetrics.score =
-            calculateConnectivityScore(currentMetrics);
+            sharedCalculateConnectivityScore(currentMetrics);
 
         lastTestTime = new Date().toISOString();
 
@@ -1334,7 +1750,7 @@ async function startNetworkTest() {
 
         setText(
             "testMessage",
-            "Network test failed. Check your backend and browser console."
+            "Network test failed. Check that the backend server is running and you are connected to the internet, then try again."
         );
 
         showToast("Network test failed.");
@@ -1342,14 +1758,16 @@ async function startNetworkTest() {
     } finally {
         testInProgress = false;
 
-        if (button) {
-            button.disabled = false;
-            button.textContent = "Start Test";
+        setStartButtonBusy(button, false);
+
+        if (isDeviceOffline()) {
+            clearLiveMetrics();
+            updateDashboard();
+            updateApplicationReadiness();
+            updateNetworkRecommendation();
+        } else {
+            updateNetworkStatus();
         }
-
-        $("networkStatusDot")?.classList.remove("testing");
-
-        updateNetworkStatus();
     }
 }
 
@@ -1507,6 +1925,8 @@ async function runCloudflareBandwidthTest() {
 
             test.onResultsChange = ({ type } = {}) => {
                 try {
+                    if (isDeviceOffline()) return;
+
                     if (type === "download") {
                         const value =
                             test.results?.getDownloadBandwidth?.();
@@ -1697,55 +2117,10 @@ async function measureBrowserLatency() {
    CONNECTIVITY SCORE
    ========================================================= */
 
-function calculateConnectivityScore(metrics) {
-    const components = [];
-
-    if (isValidMetric(metrics.download)) {
-        components.push(
-            Math.min(100, Math.max(0, Number(metrics.download)))
-        );
-    }
-
-    if (isValidMetric(metrics.upload)) {
-        components.push(
-            Math.min(100, Math.max(0, Number(metrics.upload) * 2))
-        );
-    }
-
-    if (isValidMetric(metrics.ping)) {
-        components.push(
-            Math.max(0, 100 - Number(metrics.ping) * 0.6)
-        );
-    }
-
-    if (isValidMetric(metrics.jitter)) {
-        components.push(
-            Math.max(0, 100 - Number(metrics.jitter) * 1.5)
-        );
-    }
-
-    if (isValidMetric(metrics.packetLoss)) {
-        components.push(
-            Math.max(0, 100 - Number(metrics.packetLoss) * 10)
-        );
-    }
-
-    if (!components.length) return 0;
-
-    return Math.round(
-        components.reduce((sum, value) => sum + value, 0) /
-        components.length
-    );
-}
-
 function getConnectivityStatus(score) {
-    if (!navigator.onLine) return "Offline";
-    if (score >= 80) return "Excellent";
-    if (score >= 60) return "Good";
-    if (score >= 40) return "Fair";
-    if (score > 0) return "Poor";
-
-    return "Online";
+    return resolveConnectivityIndicator(score, {
+        isOffline: isDeviceOffline()
+    }).status;
 }
 
 /* =========================================================
@@ -1753,62 +2128,58 @@ function getConnectivityStatus(score) {
    ========================================================= */
 
 function updateDashboard() {
-    setText(
-        "download",
-        formatMetric(currentMetrics.download)
-    );
+    const offline = isDeviceOffline();
 
-    setText(
-        "upload",
-        formatMetric(currentMetrics.upload)
-    );
+    if (offline) {
+        currentMetrics.score = 0;
+    } else {
+        currentMetrics.score =
+            sharedCalculateConnectivityScore(currentMetrics);
+    }
 
-    setText(
-        "ping",
-        formatMetric(currentMetrics.ping)
-    );
+    const display = resolveDashboardDisplayState(currentMetrics, {
+        isOffline: offline,
+        isTesting: testInProgress,
+        isHistoryRestored: metricsRestoredFromHistory
+    });
 
-    setText(
-        "jitter",
-        formatMetric(currentMetrics.jitter)
-    );
+    setText("download", display.download);
+    setText("upload", display.upload);
+    setText("ping", display.ping);
+    setText("jitter", display.jitter);
+    setText("packetLoss", display.packetLoss);
+    setText("metricsSubtitle", display.metricsSubtitle);
 
-    setText(
-        "packetLoss",
-        formatMetric(currentMetrics.packetLoss)
-    );
+    const networkLabel = offline
+        ? "Offline"
+        : (currentMetrics.networkType || "Unknown");
+    const networkDetail = offline
+        ? (
+            currentMetrics.networkType === "Offline" &&
+            currentMetrics.networkTypeDetail
+                ? currentMetrics.networkTypeDetail
+                : "No internet connection"
+          )
+        : currentMetrics.networkTypeDetail;
 
-    setText(
-        "networkType",
-        currentMetrics.networkType || "Unknown"
-    );
+    setText("networkType", networkLabel);
 
-    currentMetrics.score =
-        calculateConnectivityScore(currentMetrics);
+    if (networkDetail) {
+        setText("networkTypeDetail", networkDetail);
+    }
 
-    setText("score", currentMetrics.score);
+    setText("score", String(display.score));
+    setProgress("scoreProgress", display.score);
 
-    setProgress("scoreProgress", currentMetrics.score);
+    const scoreMeter = typeof $ === "function" ? $("scoreMeter") : null;
+    scoreMeter?.setAttribute?.("aria-valuenow", String(display.score));
 
-    const status = getConnectivityStatus(currentMetrics.score);
+    applyConnectivityStatusIndicator(display.score);
 
-    setText("status", status);
-
-    const dot = $("networkStatusDot");
-
-    if (dot) {
-        dot.classList.remove(
-            "connected",
-            "disconnected",
-            "testing",
-            "excellent",
-            "good",
-            "fair",
-            "poor"
-        );
-
-        dot.classList.add(
-            navigator.onLine ? "connected" : "disconnected"
+    if (offline && !testInProgress) {
+        setText(
+            "testMessage",
+            "Your device is offline. Connect to a network first."
         );
     }
 
@@ -1820,11 +2191,12 @@ function updateDashboard() {
    ========================================================= */
 
 function updateApplicationReadiness() {
-    const download = safeNumber(currentMetrics.download);
-    const upload = safeNumber(currentMetrics.upload);
-    const ping = safeNumber(currentMetrics.ping);
-    const jitter = safeNumber(currentMetrics.jitter);
-    const loss = safeNumber(currentMetrics.packetLoss);
+    const offline = isDeviceOffline();
+    const download = offline ? null : safeNumber(currentMetrics.download);
+    const upload = offline ? null : safeNumber(currentMetrics.upload);
+    const ping = offline ? null : safeNumber(currentMetrics.ping);
+    const jitter = offline ? null : safeNumber(currentMetrics.jitter);
+    const loss = offline ? null : safeNumber(currentMetrics.packetLoss);
 
     const gaming = readinessScore(
         [
@@ -1911,8 +2283,20 @@ function updateReadinessDisplay(textId, barId, value) {
         value === null ? "—" : `${value}%`
     );
 
-    if (value !== null) {
-        setProgress(barId, value);
+    setProgress(barId, value === null ? 0 : value);
+
+    // The bar's parent track carries role="progressbar".
+    const track = $(barId)?.parentElement;
+
+    if (track?.setAttribute) {
+        track.setAttribute(
+            "aria-valuenow",
+            String(value === null ? 0 : value)
+        );
+        track.setAttribute(
+            "aria-valuetext",
+            value === null ? "Not available" : `${value}%`
+        );
     }
 }
 
@@ -1991,11 +2375,27 @@ async function updateAISectionsFromBackend() {
             { cache: "no-store" }
         );
 
-        if (!response.ok) return;
+        if (!response.ok) {
+            const prediction = $("predictionResult");
+            if (prediction) {
+                prediction.textContent =
+                    "AI service is unavailable. Showing local analysis: " +
+                    prediction.textContent;
+            }
+            return;
+        }
 
         const result = await response.json();
 
-        if (!result?.success) return;
+        if (!result?.success) {
+            const prediction = $("predictionResult");
+            if (prediction) {
+                prediction.textContent =
+                    "AI analysis is unavailable. Showing local analysis: " +
+                    prediction.textContent;
+            }
+            return;
+        }
 
         const predictionData = result.prediction || {};
         const anomalyData = result.anomaly || {};
@@ -2029,6 +2429,12 @@ async function updateAISectionsFromBackend() {
         }
 
     } catch (error) {
+        const prediction = $("predictionResult");
+        if (prediction) {
+            prediction.textContent =
+                "AI service is unavailable. Showing local analysis: " +
+                prediction.textContent;
+        }
         console.info(
             "Backend AI analysis unavailable:",
             error.message
@@ -2040,7 +2446,11 @@ function updateNetworkRecommendation() {
     let recommendation =
         "Continue monitoring your connection.";
 
-    if (
+    if (isDeviceOffline()) {
+        recommendation =
+            "No active internet connection detected. Check Wi-Fi, mobile data, or airplane mode settings.";
+
+    } else if (
         currentMetrics.ping !== null &&
         currentMetrics.ping > 100
     ) {
@@ -2318,7 +2728,16 @@ const smartConnectivity = {
     startNetworkTest,
     exportHistoryToCSV,
     validateHistoryFilterValues,
-    calculateConnectivityScore
+    calculateConnectivityScore: sharedCalculateConnectivityScore,
+    getConnectivityStatus,
+    resolveConnectivityIndicator,
+    resolveDashboardDisplayState,
+    isDeviceOffline,
+    clearLiveMetrics,
+    updateDashboard,
+    updateNetworkStatus,
+    resolveNetworkType,
+    detectNetworkType
 };
 
 /* ─── Browser Exports ───────────────────────────────── */
@@ -2327,7 +2746,22 @@ if (typeof window !== "undefined") {
     window.smartConnectivity = smartConnectivity;
 
     window.calculateConnectivityScore =
-        calculateConnectivityScore;
+        sharedCalculateConnectivityScore;
+
+    window.getConnectivityStatus =
+        getConnectivityStatus;
+
+    window.resolveConnectivityIndicator =
+        resolveConnectivityIndicator;
+
+    window.resolveDashboardDisplayState =
+        resolveDashboardDisplayState;
+
+    window.isDeviceOffline =
+        isDeviceOffline;
+
+    window.updateDashboard =
+        updateDashboard;
 
     window.exportHistoryToCSV =
         exportHistoryToCSV;
@@ -2336,6 +2770,12 @@ if (typeof window !== "undefined") {
         loadNetworkHistory;
 
     window.METRIC_UNITS = METRIC_UNITS;
+
+    window.resolveNetworkType =
+        resolveNetworkType;
+
+    window.detectNetworkType =
+        detectNetworkType;
 }
 
 /* ─── Node.js Exports for Tests ─────────────────────── */
@@ -2347,7 +2787,21 @@ if (typeof module !== "undefined" && module.exports) {
         formatNumber,
         formatMetric,
         formatNetworkMetric,
-        validateHistoryFilterValues
+        validateHistoryFilterValues,
+        calculateConnectivityScore: sharedCalculateConnectivityScore,
+        getConnectivityStatus,
+        resolveConnectivityIndicator,
+        resolveDashboardDisplayState,
+        isDeviceOffline,
+        clearLiveMetrics,
+        applyConnectivityStatusIndicator,
+        updateDashboard,
+        updateNetworkStatus,
+        handleConnectivityTransition,
+        loadNetworkHistory,
+        smartConnectivity,
+        resolveNetworkType,
+        detectNetworkType
     };
 }
 /* =========================================================

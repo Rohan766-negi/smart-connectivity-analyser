@@ -24,6 +24,7 @@ import json
 import math
 import sys
 
+import platform
 import subprocess
 
 import re
@@ -59,6 +60,15 @@ except Exception as error:
     final_predictor = None
     FINAL_PREDICTOR_READY = False
     AI_IMPORT_ERROR = str(error)
+    FEATURES = ()
+    SEQUENCE_LENGTH = 8
+    ConnectivityPredictor = None
+    TransformerAutoencoder = None
+    load_network_data = lambda: []
+    normalize_values = None
+    denormalize_value = None
+    final_predictor = None
+    FINAL_PREDICTOR_READY = False
 else:
     AI_IMPORT_ERROR = None
 
@@ -366,13 +376,19 @@ def initialize_database():
 
 
 
+
 initialize_database()
+
 if "final_predictor" not in globals() or final_predictor is None:
     try:
-        from backend.final_predictor import final_predictor, FINAL_PREDICTOR_READY
+        from backend.final_predictor import (
+            final_predictor,
+            FINAL_PREDICTOR_READY,
+        )
     except Exception:
         final_predictor = None
         FINAL_PREDICTOR_READY = False
+
 AI_MODELS_READY, AI_MODELS_MESSAGE = load_ai_models()
 
 
@@ -577,12 +593,79 @@ def ping():
 
 
 
+# ============================================================
+# PING OUTPUT PARSING
+# ============================================================
+
+# Matches one reply's round-trip time on Windows ("time=12ms",
+# "time<1ms") and Linux/macOS ("time=12.4 ms").
+PING_TIME_PATTERN = re.compile(
+    r"time[=<]\s*(\d+(?:\.\d+)?)\s*ms",
+    re.IGNORECASE,
+)
+
+# Matches the packet-loss summary on Windows ("(0% loss)"),
+# Linux ("25% packet loss") and macOS ("0.0% packet loss").
+PACKET_LOSS_PATTERN = re.compile(
+    r"(\d+(?:\.\d+)?)%\s*(?:packet\s+)?loss",
+    re.IGNORECASE,
+)
+
+
+def parse_ping_output(output):
+    """Return (ping_times_ms, packet_loss_percent) from ping output.
+
+    packet_loss_percent is None when no loss summary is found.
+    """
+    ping_times = [
+        float(value)
+        for value in PING_TIME_PATTERN.findall(output)
+    ]
+
+    loss_match = PACKET_LOSS_PATTERN.search(output)
+    packet_loss = float(loss_match.group(1)) if loss_match else None
+
+    return ping_times, packet_loss
+
+
+def build_ping_command(target, packet_count, timeout_seconds, system):
+    """Return the ping command for the given operating system.
+
+    system is a platform.system() value: "Windows", "Linux" or
+    "Darwin" (macOS). The target goes last, because macOS stops
+    reading options at the first non-option argument.
+    """
+    if system == "Windows":
+        # -n: number of pings, -w: reply timeout in milliseconds.
+        return [
+            "ping",
+            "-n", str(packet_count),
+            "-w", str(timeout_seconds * 1000),
+            target,
+        ]
+
+    if system == "Darwin":
+        # -c: number of pings, -W: reply timeout in milliseconds.
+        return [
+            "ping",
+            "-c", str(packet_count),
+            "-W", str(timeout_seconds * 1000),
+            target,
+        ]
+
+    # Linux and other Unix-like systems.
+    # -c: number of pings, -W: reply timeout in seconds.
+    return [
+        "ping",
+        "-c", str(packet_count),
+        "-W", str(timeout_seconds),
+        target,
+    ]
+
 
 # ============================================================
 
 # NETWORK QUALITY
-
-# WINDOWS PING
 
 # ============================================================
 
@@ -602,25 +685,14 @@ def network_quality():
 
 
 
-    timeout_ms = 2000
+    timeout_seconds = 2
 
-
-
-    command = [
-
-        "ping",
-
+    command = build_ping_command(
         target,
-
-        "-n",
-
-        str(packet_count),
-
-        "-w",
-
-        str(timeout_ms)
-
-    ]
+        packet_count,
+        timeout_seconds,
+        platform.system(),
+    )
 
 
 
@@ -645,6 +717,12 @@ def network_quality():
         output = process.stdout
 
 
+
+    except FileNotFoundError:
+        raise HTTPException(
+            status_code=503,
+            detail="The ping command is not available on this server.",
+        )
 
     except subprocess.TimeoutExpired:
 
@@ -675,117 +753,34 @@ def network_quality():
 
 
 
-
+    # ========================================================
+    # PARSE PING TIMES AND PACKET LOSS
     # ========================================================
 
-    # PARSE INDIVIDUAL PING TIMES
+    ping_times, packet_loss = parse_ping_output(output)
 
-    # ========================================================
-
-
-
-    ping_times = []
-
-
-
-    matches = re.findall(
-
-        r"time[=<]\s*(\d+)\s*ms",
-
-        output,
-
-        re.IGNORECASE
-
-    )
-
-
-
-
-
-    for match in matches:
-
-
-
-        try:
-
-
-
-            ping_times.append(
-
-                float(match)
-
-            )
-
-
-
-        except ValueError:
-
-            pass
-
-
-
-
-
-    # ========================================================
-
-    # PACKET LOSS
-
-    # ========================================================
-
-
-
-    loss_match = re.search(
-
-        r"\((\d+)%\s*loss\)",
-
-        output,
-
-        re.IGNORECASE
-
-    )
-
-
-
-
-
-    if loss_match:
-
-
-
-        packet_loss = float(
-
-            loss_match.group(1)
-
+    # No replies and no loss summary means ping failed to run
+    # (for example, no permission to send pings). That is not
+    # the same as a real 100% packet loss.
+    if not ping_times and packet_loss is None:
+        reason = process.stderr.strip() or "ping produced no output"
+        raise HTTPException(
+            status_code=503,
+            detail=f"Ping measurement failed: {reason}",
         )
 
 
-
-    else:
-
-
-
+    # If ping printed no loss summary, estimate it from
+    # how many replies were received.
+    if packet_loss is None:
         packet_loss = (
-
-            (
-
-                packet_count -
-
-                len(ping_times)
-
-            )
-
+            (packet_count - len(ping_times))
             / packet_count
-
         ) * 100
 
 
-
-
-
     # ========================================================
-
     # NO RESPONSE
-
     # ========================================================
 
 
@@ -1209,6 +1204,17 @@ def save_network_test(data: NetworkTest):
 # ============================================================
 
 
+HISTORY_RANGE_WINDOWS = {
+    "1h": timedelta(hours=1),
+    "24h": timedelta(hours=24),
+    "7d": timedelta(days=7),
+    "recent": timedelta(days=1),
+    # Preserve existing API range values for compatibility.
+    "hourly": timedelta(hours=24),
+    "daily": timedelta(days=7),
+    "weekly": timedelta(days=30),
+    "monthly": timedelta(days=365),
+}
 
 
 @app.get("/api/network-history")
@@ -1219,6 +1225,13 @@ def get_network_history(
     min_score: float | None = Query(default=None, ge=0, le=100),
     max_score: float | None = Query(default=None, ge=0, le=100),
 ):
+    if range != "all" and range not in HISTORY_RANGE_WINDOWS:
+        supported = ", ".join(["all", *HISTORY_RANGE_WINDOWS])
+        raise HTTPException(
+            status_code=422,
+            detail=f"Unsupported range '{range}'. Supported values: {supported}",
+        )
+
     # Validate date range.
     if (
         start_date is not None
@@ -1252,31 +1265,12 @@ def get_network_history(
         # Preserve the existing time-range behaviour
         # whenever a custom date range is not supplied.
         if start_date is None and end_date is None:
-
             if range != "all":
+                duration = HISTORY_RANGE_WINDOWS[range]
+                since = datetime.now() - duration
+                conditions.append("timestamp >= ?")
+                parameters.append(since.isoformat())
 
-                    range_windows = {
-                        "1h": timedelta(hours=1),
-                        "24h": timedelta(hours=24),
-                        "7d": timedelta(days=7),
-                        "recent": timedelta(days=1),
-
-                        # Preserve existing API range values for compatibility.
-                        "hourly": timedelta(hours=24),
-                        "daily": timedelta(days=7),
-                        "weekly": timedelta(days=30),
-                        "monthly": timedelta(days=365),
-                    }
-
-                    duration = range_windows.get(
-                        range,
-                        timedelta(days=1),
-                    )
-
-                    since = datetime.now() - duration
-
-                    conditions.append("timestamp >= ?")
-                    parameters.append(since.isoformat())
 
         else:
             if start_date is not None:
@@ -1363,7 +1357,7 @@ def ai_prediction():
     if not FINAL_PREDICTOR_READY:
         raise HTTPException(
             status_code=503,
-            detail=final_predictor.message,
+            detail=getattr(final_predictor, "message", AI_MODELS_MESSAGE),
         )
 
     try:
@@ -1475,6 +1469,15 @@ def ai_anomaly():
 
 @app.get("/api/ai/analyze")
 def ai_analyze():
+    if not AI_MODELS_READY:
+        return {
+            "success": False,
+            "available": False,
+            "message": AI_MODELS_MESSAGE,
+            "prediction": None,
+            "anomaly": None,
+        }
+
     return {
         "success": True,
         "prediction": ai_prediction(),
